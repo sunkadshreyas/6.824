@@ -10,3 +10,10 @@ func DPrintf(format string, a ...interface{}) {
 		log.Printf(format, a...)
 	}
 }
+
+func customMinFunc(a int, b int ) int {
+	if a < b {
+		return a
+	}
+	return b
+}
