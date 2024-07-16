@@ -18,13 +18,13 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -122,12 +122,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
@@ -138,17 +139,18 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var rfCurrentTerm int
+	var rfVotedFor int
+	var rfLogs []LogEntry
+	if d.Decode(&rfCurrentTerm) != nil || d.Decode(&rfVotedFor) != nil  || d.Decode(&rfLogs) != nil {
+		return 
+	} else {
+	  rf.currentTerm = rfCurrentTerm
+	  rf.votedFor = rfVotedFor
+	  rf.logs = rfLogs
+	}
 }
 
 
@@ -188,6 +190,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		index = rf.getLastLogIndex() + 1
 		rf.logs = append(rf.logs, LogEntry{Term: term, Command: command, Index: index})
+		// persist the initial state upon startup
+		rf.persist()
 	}
 
 	return index, term, isLeader
@@ -223,40 +227,30 @@ func (rf *Raft) ticker() {
 			select {
 			case <-rf.chanGrantVote:
 			case <-rf.chanHeartBeat:
-			case <-time.After(time.Millisecond * time.Duration(300 + rand.Intn(200))):
-				DPrintf("[%d] has decided to contest for elections", rf.me)
+			case <-time.After(time.Millisecond * time.Duration(200 + rand.Intn(300))):
+				// DPrintf("[%d] has decided to contest for elections", rf.me)
 				rf.state = CandidateState
+				rf.persist()
 			}
 		case CandidateState:
 			rf.mu.Lock()
 			rf.currentTerm += 1
 			rf.votedFor = rf.me
 			rf.voteCount = 1
+			rf.persist()
 			rf.mu.Unlock()
 			go rf.broadcastRequestVote()
-
-			DPrintf("[%d] has decide to campaign for votes for term %d", rf.me, rf.currentTerm)
 
 			select {
 			case <-rf.chanHeartBeat:
 				rf.state = FollowerState
 			case <-rf.chanWinEle:
-				rf.mu.Lock()
-				rf.nextIndex = make([]int, len(rf.peers))
-				rf.matchIndex = make([]int, len(rf.peers))
-				nextIndex := rf.getLastLogIndex() + 1
-				for i := range rf.nextIndex {
-					rf.nextIndex[i] = nextIndex
-				}
-				rf.state = LeaderState
-				rf.mu.Unlock()	
-				DPrintf("[%d] has won the election for term %d", rf.me, rf.currentTerm)
-			case <-time.After(time.Millisecond * time.Duration(300 + rand.Intn(200))):	
+			case <-time.After(time.Millisecond * time.Duration(200 + rand.Intn(300))):	
 			}
 		case LeaderState:
 			// leader sends empty append args as part of heartbeat
 			go rf.broadcastAppendEntries()
-			time.Sleep(time.Millisecond * 200)
+			time.Sleep(time.Millisecond * 150)
 		}
 
 
@@ -302,15 +296,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// persist the state upon creation of Raft server
+	rf.persist()
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
 
 func (rf *Raft) getLastLogIndex() int {
-	return len(rf.logs) - 1
+	return rf.logs[len(rf.logs) - 1].Index
 }
 
 func (rf *Raft) getLastLogTerm() int {

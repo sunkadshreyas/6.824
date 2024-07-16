@@ -24,6 +24,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// votedFor and currentTerm would have changed
+	defer rf.persist()
 
 	if args.Term < rf.currentTerm {
 		// if current term is greater than incoming term, do not vote for such candidates
@@ -82,6 +84,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// votedFor and currentTerm could have changed
+	defer rf.persist()
 
 	if ok {
 		if rf.state != CandidateState || rf.currentTerm != args.Term {
@@ -99,7 +103,16 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		if reply.VoteGranted {
 			rf.voteCount += 1
 			if rf.voteCount > len(rf.peers) / 2 {
+				// Things to do after winning the election
+				DPrintf("[%d] has won the election for term %d", rf.me, rf.currentTerm)
 				rf.state = LeaderState
+				rf.persist()
+				rf.nextIndex = make([]int, len(rf.peers))
+				rf.matchIndex = make([]int, len(rf.peers))
+				nextIndex := rf.getLastLogIndex() + 1
+				for peer := range rf.peers {
+					rf.nextIndex[peer] = nextIndex
+				}
 				rf.chanWinEle <- true
 			}
 		}
@@ -110,7 +123,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) broadcastRequestVote() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	args := &RequestVoteArgs{
 		Term: rf.currentTerm,
@@ -119,11 +131,11 @@ func (rf *Raft) broadcastRequestVote() {
 		LastLogTerm: rf.getLastLogTerm(),
 	}
 
-	reply := &RequestVoteReply{}
+	rf.mu.Unlock()
 
 	for peer := range rf.peers {
 		if peer != rf.me && rf.state == CandidateState {
-			go rf.sendRequestVote(peer, args, reply)
+			go rf.sendRequestVote(peer, args, &RequestVoteReply{})
 		}
 	}
 }
