@@ -7,4 +7,4 @@ This is my implementation of Lab assigments for Distributed Systems Lab in Golan
 - [X] Leader Election
 - [X] Log Replication
 - [X] Persistance
-- [] Log Compaction 
+- [ ] Log Compaction 
