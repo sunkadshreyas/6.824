@@ -38,6 +38,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm int
 
 	// For 3D:
 	SnapshotValid bool
@@ -84,6 +85,11 @@ type Raft struct {
 	heartbeatTimeout time.Duration
 	electionTimeout time.Duration
 	electionTimestamp time.Time
+
+	applyCh chan ApplyMsg
+
+	broadcasterCond []*sync.Cond
+	applierCond *sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -155,7 +161,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.state != LeaderState {
+		return index, term, isLeader
+	}
+
+	newLogEntry := LogEntry{
+		Term: rf.currentTerm,
+		Index: len(rf.logs),
+		Command: command,
+	}
+	rf.logs = append(rf.logs, newLogEntry)
+
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		rf.broadcasterCond[peer].Signal()
+	}
+
+	return len(rf.logs) - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -187,7 +211,12 @@ func (rf *Raft) ticker() {
 
 		if rf.state == LeaderState {
 			// if I am the leader, send AppendEntries to remind everyone I am the leader
-			rf.broadcastAppendEntries()
+			for peer := range rf.peers {
+				if peer == rf.me {
+					continue
+				}
+				rf.broadcastHeartbeat(peer)
+			}
 		}
 
 		rf.mu.Lock()
@@ -227,23 +256,32 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = make([]LogEntry, 0)
 	rf.logs = append(rf.logs, LogEntry{})
 
+	rf.applierCond = sync.NewCond(&rf.mu)
+	rf.broadcasterCond = make([]*sync.Cond, len(peers))
+
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	lastLog := rf.logs[len(rf.logs) - 1]
+
 	for peer := range rf.peers {
+		rf.nextIndex[peer] = rf.getLastLogIndex() + 1
+		rf.matchIndex[peer] = rf.nextIndex[peer] - 1
 		if peer != rf.me {
-			rf.nextIndex[peer] = lastLog.Index + 1
-			rf.matchIndex[peer] = lastLog.Index
+			rf.broadcasterCond[peer] = sync.NewCond(&sync.Mutex{})
+			go rf.broadcaster(peer)
 		}
 	}
+
+	rf.applyCh = applyCh
 
 	rf.heartbeatTimeout = 50 * time.Millisecond
 	rf.resetElectionTimer()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go rf.applier()
 
 	return rf
 }

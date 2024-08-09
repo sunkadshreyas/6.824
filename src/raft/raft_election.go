@@ -29,8 +29,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.updateTerm(args.Term)
 	}
 
-	lastLog := rf.logs[len(rf.logs) - 1]
-	upToDate := args.LastLogTerm > lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index) 
+	lastLogIndex := rf.getLastLogIndex()
+	lastLogTerm := rf.getLastLogTerm()
+	upToDate := args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) 
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && upToDate {
 		reply.VoteGranted = true
@@ -57,9 +58,18 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, voteCount *in
 		return
 	}
 
-	if atomic.AddInt32(voteCount, 1) >= int32(len(rf.peers) / 2) && rf.state == CandidateState && rf.currentTerm == args.Term {
+	if atomic.AddInt32(voteCount, 1) > int32(len(rf.peers) / 2) && rf.state == CandidateState && rf.currentTerm == args.Term {
 		rf.state = LeaderState
-		rf.broadcastAppendEntries()
+		for peer := range rf.peers {
+			rf.nextIndex[peer] = rf.getLastLogIndex() + 1
+			rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+		}
+		for peer := range rf.peers {
+			if peer == rf.me {
+				continue
+			}
+			rf.broadcastHeartbeat(peer)
+		}
 	}
 }
 
