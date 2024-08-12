@@ -68,6 +68,7 @@ func (rf *Raft) applier() {
 		if rf.lastApplied < commitIndex {
 			rf.lastApplied = commitIndex
 		}
+		rf.persist()
 		rf.mu.Unlock()
 	}
 }

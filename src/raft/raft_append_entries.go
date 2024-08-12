@@ -12,13 +12,17 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	// To decide from which point onwards to send the logs
+	ConflictIndex int 
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	reply.Success = false
+	reply.ConflictIndex = -1
 	
 	if args.Term < rf.currentTerm {
 		// I am in greater term, so respond back with false message
@@ -43,7 +47,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.logs = rf.logs[:args.PrevLogIndex]
+		currTerm := rf.logs[args.PrevLogIndex].Term
+		var conflictIndex int
+		for i := args.PrevLogIndex; i > 0; i-- {
+			if rf.logs[i - 1].Term != currTerm {
+				conflictIndex = i
+				break
+			}
+		}
+		reply.ConflictIndex = conflictIndex
 		return
 	}
 
@@ -70,6 +82,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
 		return
 	}
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	if reply.Term > rf.currentTerm {
@@ -77,8 +90,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
 		return
 	}
 
-	if reply.Success && len(args.Entries) > 0 {
-		rf.nextIndex[server] = args.Entries[len(args.Entries) - 1].Index + 1
+	if reply.Success {
+		if len(args.Entries) > 0 {
+			rf.nextIndex[server] = args.Entries[len(args.Entries) - 1].Index + 1
+		}
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
 
 		for index := range rf.logs {
@@ -92,8 +107,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
 				rf.commitIndex = index
 			}
 		}
-	} else if reply.Success == false {
-		rf.nextIndex[server] = customMaxFunc(0, rf.nextIndex[server] - 1)
+	} else {
+		rf.nextIndex[server] = customMaxFunc(1, reply.ConflictIndex - 1)
 	}
 
 	rf.applierCond.Signal()
@@ -141,6 +156,7 @@ func (rf *Raft) broadcaster(peer int) {
 
 func (rf *Raft) noNeedReplicating(peer int) bool {
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 	return rf.state != LeaderState || rf.matchIndex[peer] >= rf.getLastLogIndex()
 }

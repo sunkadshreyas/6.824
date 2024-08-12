@@ -18,10 +18,13 @@ package raft
 //
 
 import (
+	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -116,7 +119,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 
@@ -127,7 +136,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
+		log.Fatal("error when reading persisted data")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+	}
 }
 
 
@@ -159,6 +181,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	if rf.state != LeaderState {
@@ -277,6 +300,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.heartbeatTimeout = 50 * time.Millisecond
 	rf.resetElectionTimer()
+
+	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

@@ -16,6 +16,7 @@ type RequestVoteReply struct {
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	reply.VoteGranted = false
@@ -49,6 +50,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, voteCount *in
 	}
 
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	if !reply.VoteGranted {
