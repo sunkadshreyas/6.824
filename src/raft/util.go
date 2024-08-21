@@ -44,15 +44,16 @@ func (rf *Raft) resetElectionTimer() {
 }
 
 func (rf *Raft) applier() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		rf.mu.Lock()
 		for rf.lastApplied >= rf.commitIndex {
 			rf.applierCond.Wait()
 		}
+		firstLogIndex := rf.logs[0].Index
 		lastApplied := rf.lastApplied
 		commitIndex := rf.commitIndex
 		logEntries := make([]LogEntry, commitIndex - lastApplied)
-		copy(logEntries, rf.logs[lastApplied + 1 : commitIndex + 1])
+		copy(logEntries, rf.logs[lastApplied + 1 - firstLogIndex : commitIndex + 1 - firstLogIndex])
 		rf.mu.Unlock()
 
 		for _, entry := range logEntries {
@@ -79,4 +80,22 @@ func (rf *Raft) getLastLogIndex() int {
 
 func (rf *Raft) getLastLogTerm() int {
 	return rf.logs[len(rf.logs) - 1].Term
+}
+
+func (rf *Raft) IsNewTermValid(newTerm int) bool {
+	if newTerm < rf.currentTerm {
+		return false
+	}
+	if newTerm > rf.currentTerm {
+		rf.updateTerm(newTerm)
+	}
+	return true
+}
+
+func (rf *Raft) IsReplyTermGreater(replyTerm int) bool {
+	if replyTerm > rf.currentTerm {
+		rf.updateTerm(replyTerm)
+		return true
+	}
+	return false
 }

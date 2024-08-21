@@ -22,12 +22,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
 
-	if args.Term < rf.currentTerm {
+	if !rf.IsNewTermValid(args.Term) {
 		return
-	}
-
-	if args.Term > rf.currentTerm {
-		rf.updateTerm(args.Term)
 	}
 
 	lastLogIndex := rf.getLastLogIndex()
@@ -53,10 +49,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, voteCount *in
 	defer rf.persist()
 	defer rf.mu.Unlock()
 
+	if rf.IsReplyTermGreater(reply.Term) {
+		return
+	}
+
 	if !reply.VoteGranted {
-		if reply.Term > rf.currentTerm {
-			rf.updateTerm(reply.Term)
-		}
 		return
 	}
 
@@ -66,12 +63,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, voteCount *in
 			rf.nextIndex[peer] = rf.getLastLogIndex() + 1
 			rf.matchIndex[peer] = rf.nextIndex[peer] - 1
 		}
-		for peer := range rf.peers {
-			if peer == rf.me {
-				continue
-			}
-			rf.broadcastHeartbeat(peer)
-		}
+		DPrintf("[%d] became leader for term %d\n", rf.me, rf.currentTerm)
+		rf.broadcastAppendEntries(true)
 	}
 }
 

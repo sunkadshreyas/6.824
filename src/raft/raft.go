@@ -119,13 +119,7 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.logs)
-	raftState := w.Bytes()
-	rf.persister.Save(raftState, nil)
+	rf.persister.Save(rf.encodeState(), rf.persister.ReadSnapshot())
 }
 
 
@@ -149,7 +143,17 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logs = logs
+		rf.lastApplied = rf.logs[0].Index
 	}
+}
+
+func (rf *Raft) encodeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	return w.Bytes()
 }
 
 
@@ -159,7 +163,17 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.logs[0].Index >= index {
+		return
+	}
+	firstLogIndex := rf.logs[0].Index
+	trimLen := index - firstLogIndex
+	rf.logs = append([]LogEntry{}, rf.logs[trimLen:]...)
+	rf.logs[0].Command = nil
+	rf.persister.Save(rf.encodeState(), snapshot)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -181,7 +195,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 	rf.mu.Lock()
-	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	if rf.state != LeaderState {
@@ -190,19 +203,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	newLogEntry := LogEntry{
 		Term: rf.currentTerm,
-		Index: len(rf.logs),
+		Index: rf.getLastLogIndex() + 1,
 		Command: command,
 	}
 	rf.logs = append(rf.logs, newLogEntry)
 
-	for peer := range rf.peers {
-		if peer == rf.me {
-			continue
-		}
-		rf.broadcasterCond[peer].Signal()
-	}
+	rf.broadcastAppendEntries(false)
 
-	return len(rf.logs) - 1, rf.currentTerm, true
+	return rf.getLastLogIndex(), rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -234,12 +242,7 @@ func (rf *Raft) ticker() {
 
 		if rf.state == LeaderState {
 			// if I am the leader, send AppendEntries to remind everyone I am the leader
-			for peer := range rf.peers {
-				if peer == rf.me {
-					continue
-				}
-				rf.broadcastHeartbeat(peer)
-			}
+			rf.broadcastAppendEntries(true)
 		}
 
 		rf.mu.Lock()

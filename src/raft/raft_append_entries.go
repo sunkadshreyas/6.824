@@ -23,16 +23,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = false
 	reply.ConflictIndex = -1
-	
-	if args.Term < rf.currentTerm {
-		// I am in greater term, so respond back with false message
-		reply.Term = rf.currentTerm
-		return
-	}
+	reply.Term = rf.currentTerm
 
-	if args.Term > rf.currentTerm {
-		// incoming term is greater, update my term to the latest value
-		rf.updateTerm(args.Term)
+	if !rf.IsNewTermValid(args.Term) {
+		return
 	}
 
 	if rf.state == CandidateState {
@@ -40,28 +34,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.resetElectionTimer()
-	reply.Term = rf.currentTerm
 
-	if args.PrevLogIndex >= len(rf.logs) {
+	prevLogIndex := args.PrevLogIndex - rf.logs[0].Index
+	if prevLogIndex < 0 {
+		reply.ConflictIndex = 0
 		return
 	}
 
-	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		currTerm := rf.logs[args.PrevLogIndex].Term
+	if prevLogIndex >= len(rf.logs) {
+		return
+	}
+
+	if rf.logs[prevLogIndex].Term != args.PrevLogTerm {
+		currTerm := rf.logs[prevLogIndex].Term
 		var conflictIndex int
-		for i := args.PrevLogIndex; i > 0; i-- {
+		for i := prevLogIndex; i > 0; i-- {
 			if rf.logs[i - 1].Term != currTerm {
 				conflictIndex = i
 				break
 			}
 		}
-		reply.ConflictIndex = conflictIndex
+		reply.ConflictIndex = conflictIndex + rf.logs[0].Index
 		return
 	}
 
 	for _, entry := range args.Entries {
-		if entry.Index >= len(rf.logs) || rf.logs[entry.Index].Term != entry.Term {
-			rf.logs = append([]LogEntry{}, append(rf.logs[:args.PrevLogIndex + 1], args.Entries...)...)
+		logIndex := entry.Index - rf.logs[0].Index
+		if logIndex >= len(rf.logs) || rf.logs[logIndex].Term != entry.Term {
+			rf.logs = append([]LogEntry{}, append(rf.logs[:prevLogIndex + 1], args.Entries...)...)
 			break
 		}
 	}
@@ -69,7 +69,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 
 	if args.CommitIndex > rf.commitIndex {
-		rf.commitIndex = customMinFunc(len(rf.logs) - 1, args.CommitIndex)
+		rf.commitIndex = args.CommitIndex
+		if args.CommitIndex - rf.logs[0].Index >= len(rf.logs) {
+			rf.commitIndex = rf.getLastLogIndex()
+		}
 	}
 
 	rf.applierCond.Signal()
@@ -85,8 +88,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
 	defer rf.persist()
 	defer rf.mu.Unlock()
 
-	if reply.Term > rf.currentTerm {
-		rf.updateTerm(reply.Term)
+	if rf.IsReplyTermGreater(reply.Term) {
 		return
 	}
 
@@ -96,14 +98,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
 		}
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
 
-		for index := range rf.logs {
+		for _, log := range rf.logs {
+			index := log.Index
 			count := 1
 			for peer := range rf.peers {
 				if peer != rf.me && rf.matchIndex[peer] >= index {
 					count += 1
 				}
 			}
-			if count > len(rf.peers) / 2 && index > rf.commitIndex && rf.logs[index].Term == rf.currentTerm {
+			if count > len(rf.peers) / 2 && index > rf.commitIndex && log.Term == rf.currentTerm {
 				rf.commitIndex = index
 			}
 		}
@@ -114,49 +117,73 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
 	rf.applierCond.Signal()
 }
 
-func (rf *Raft) broadcastHeartbeat(peer int) {
-	prevLogIndex := customMinFunc(rf.nextIndex[peer] - 1, rf.getLastLogIndex())
-	prevLogTerm := rf.logs[prevLogIndex].Term
+func (rf *Raft) broadcastAppendEntries(fromHeartbeat bool) {
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		if fromHeartbeat {
+			rf.prepareAppendEntries(peer, true)
+		} else {
+			rf.broadcasterCond[peer].Signal()
+		}
+	}
+}
 
-	args := &AppendEntriesArgs{}
-	args.Term = rf.currentTerm
-	args.LeaderID = rf.me
-	args.Entries = rf.logs[rf.nextIndex[peer]:]
-	args.PrevLogIndex = prevLogIndex
-	args.PrevLogTerm = prevLogTerm
-	args.CommitIndex = rf.commitIndex
-
-	go rf.sendAppendEntries(peer, args)
+func (rf *Raft) prepareAppendEntries(peer int, fromHeartbeat bool) {
+	firstLog := rf.logs[0]
+	nextIndexForPeer := rf.nextIndex[peer]
+	if nextIndexForPeer > firstLog.Index {
+		nextIndexForPeer = nextIndexForPeer - firstLog.Index
+		prevLog := rf.logs[nextIndexForPeer - 1]
+		args := AppendEntriesArgs{
+			LeaderID: rf.me,
+			Term: rf.currentTerm,
+			PrevLogIndex: prevLog.Index,
+			PrevLogTerm: prevLog.Term,
+			// Send the logs from the index until which logs have been committed
+			Entries: rf.logs[nextIndexForPeer:],
+			CommitIndex: rf.commitIndex,
+		}
+		if fromHeartbeat {
+			go rf.sendAppendEntries(peer, &args)
+		} else {
+			rf.sendAppendEntries(peer, &args)
+		}
+	} else {
+		args := InstallSnapshotArgs{
+			Term : rf.currentTerm,
+			LeaderID: rf.me,
+			LastIncludedIndex: rf.logs[0].Index,
+			LastIncludedTerm: rf.logs[0].Term,
+			Offset: 0,
+			Data: rf.persister.ReadSnapshot(),
+			Done: true,
+		}
+		if fromHeartbeat {
+			go rf.sendInstallSnapshot(peer, &args)
+		} else {
+			go rf.sendInstallSnapshot(peer, &args)
+		}
+	}
 }
 
 func (rf *Raft) broadcaster(peer int) {
 	rf.broadcasterCond[peer].L.Lock()
 	defer rf.broadcasterCond[peer].L.Unlock()
 
-	for rf.killed() == false {
+	for !rf.killed() {
 		
-		for rf.noNeedReplicating(peer) {
+		for !rf.IsReplicationNedded(peer) {
 			rf.broadcasterCond[peer].Wait()
 		}
 
-		prevLogIndex := customMinFunc(rf.nextIndex[peer] - 1, rf.getLastLogIndex())
-		prevLogTerm := rf.logs[prevLogIndex].Term
-
-		args := &AppendEntriesArgs{}
-		args.Term = rf.currentTerm
-		args.LeaderID = rf.me
-		args.Entries = rf.logs[rf.nextIndex[peer]:]
-		args.PrevLogIndex = prevLogIndex
-		args.PrevLogTerm = prevLogTerm
-		args.CommitIndex = rf.commitIndex
-
-		rf.sendAppendEntries(peer, args) 
+		rf.prepareAppendEntries(peer, false)
 	}
 }
 
-func (rf *Raft) noNeedReplicating(peer int) bool {
+func (rf *Raft) IsReplicationNedded(peer int) bool {
 	rf.mu.Lock()
-	defer rf.persist()
 	defer rf.mu.Unlock()
-	return rf.state != LeaderState || rf.matchIndex[peer] >= rf.getLastLogIndex()
+	return rf.state == LeaderState && rf.matchIndex[peer] < rf.getLastLogIndex()
 }
