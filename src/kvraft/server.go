@@ -1,12 +1,15 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -23,31 +26,157 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op OpType
+	Key string
+	Value string
+	ClientID int64
+	RequestID int
+}
+
+type Result struct {
+	index int
+	term int
+	value string
+	err Err
+}
+
+type Req struct {
+	RequestID int
+	Value string
+	Err Err
 }
 
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
 	rf      *raft.Raft
+	ps *raft.Persister
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data map[string]string
+	clientReqMap map[int64]Req
+	chanMap map[int64]chan Result
+}
+
+func getChannelID(term, index int) int64 {
+	id := int64(term) << 32
+	id += int64(index)
+	return id
+}
+
+func (kv *KVServer) createChannel(term, index int) chan Result {
+	chanID := getChannelID(term, index)
+	ch := make(chan Result, 1)
+	kv.chanMap[chanID] = ch
+	return ch
+}
+
+func (kv *KVServer) deleteChannel(term, index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	chanID := getChannelID(term, index)
+	close(kv.chanMap[chanID])
+	delete(kv.chanMap, chanID)
+}
+
+func (kv *KVServer) isReqPresent(clientID int64, requestID int) (bool, string, Err) {
+	reqEntry, ok := kv.clientReqMap[clientID]
+	if ok && reqEntry.RequestID >= requestID {
+		return true, reqEntry.Value, reqEntry.Err
+	}
+	return false, "", ErrWrongLeader
+}
+
+func (kv *KVServer) encode() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.clientReqMap)
+	return w.Bytes()
+}
+
+func (kv *KVServer) decode(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	
+	var dataMap map[string]string
+	var reqMap map[int64]Req
+
+	if d.Decode(&dataMap) != nil || d.Decode(&reqMap) != nil {
+		log.Fatalf("error when decoding data and client req map")
+		return
+	}
+
+	kv.data = dataMap
+	kv.clientReqMap = reqMap
+}
+
+func (kv *KVServer) startRaft(key, value string, op OpType, clientID int64, reqID int, ch chan GetReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if isPresent, val, err := kv.isReqPresent(clientID, reqID); isPresent {
+		ch <- GetReply{Err: err, Value: val}
+		return
+	}
+
+	command := Op{
+		Op: op,
+		Key: key,
+		Value: value,
+		ClientID: clientID,
+		RequestID: reqID,
+	}
+	index, term, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		ch <- GetReply{Err: ErrWrongLeader, Value: ""}
+		return
+	}
+	resch := kv.createChannel(term, index)
+	go kv.waitRaft(term, index, ch, resch)
+}
+
+func (kv *KVServer) waitRaft(term, index int, ch chan GetReply, resCh chan Result) {
+	timer := time.NewTimer(500 * time.Millisecond)
+	select {
+	case <- timer.C:
+		ch <- GetReply{Err: ErrWrongLeader, Value: ""}
+	case res := <- resCh:
+		ch <- GetReply{Err: res.err, Value: res.value}
+	}
+	kv.deleteChannel(term, index)
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	ch := make(chan GetReply)
+	go kv.startRaft(args.Key, "", GET, args.ClientID, args.RequestID, ch)
+	r := <- ch
+	reply.Value = r.Value
+	reply.Err = r.Err
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	ch := make(chan GetReply)
+	go kv.startRaft(args.Key, args.Value, PUT, args.ClientID, args.RequestID, ch)
+	r := <- ch
+	reply.Err = r.Err
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	ch := make(chan GetReply)
+	go kv.startRaft(args.Key, args.Value, APPEND, args.ClientID, args.RequestID, ch)
+	r := <- ch
+	reply.Err = r.Err
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -67,6 +196,67 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) Run() {
+	for !kv.killed() {
+		var index, term int
+		msg := <- kv.applyCh
+		kv.mu.Lock()
+		if msg.CommandValid {
+			index = msg.CommandIndex
+			term = msg.CommandTerm
+			op := msg.Command.(Op)
+			opType, key, val, clientId, reqId := op.Op, op.Key, op.Value, op.ClientID, op.RequestID
+			var err Err
+			if isPresent, existingVal, existingErr := kv.isReqPresent(clientId, reqId); isPresent {
+				err = existingErr
+				val = existingVal
+			} else {
+				if opType == GET {
+					mapValue, isKeyPresent := kv.data[key]
+					if isKeyPresent {
+						val = mapValue
+						err = OK
+					} else {
+						val = ""
+						err = ErrNoKey
+					}
+				} else if opType == PUT {
+					kv.data[key] = val
+					err = OK
+				} else if opType == APPEND{
+					kv.data[key] += val
+					err = OK
+				} else {
+					log.Fatalf("invalid operation type %v", opType)
+				}
+				if _, ok := kv.clientReqMap[clientId]; !ok {
+					kv.clientReqMap[clientId] = Req{}
+				}
+				clientReqMap := Req {
+					RequestID: reqId,
+					Value: val,
+					Err: err,
+				}
+				kv.clientReqMap[clientId] = clientReqMap
+				if kv.maxraftstate != -1 && kv.maxraftstate < kv.ps.RaftStateSize() {
+					kv.rf.Snapshot(index, kv.encode())
+				}
+			}
+			if ch, ok := kv.chanMap[getChannelID(term, index)]; ok {
+				select {
+				case ch <- Result{index: index, term: term, value: val, err: err}:
+				default:
+				}
+			}
+		} else if msg.SnapshotValid {
+			kv.decode(msg.Snapshot)
+		} else {
+			log.Fatalf("invalid msg %+v\n", msg)
+		}
+		kv.mu.Unlock()
+	}
 }
 
 // servers[] contains the ports of the set of
@@ -94,8 +284,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.ps = persister
 
 	// You may need initialization code here.
+	kv.data = make(map[string]string)
+	kv.clientReqMap = make(map[int64]Req)
+	kv.chanMap = make(map[int64]chan Result)
+
+	kv.decode(kv.ps.ReadSnapshot())
+
+	go kv.Run()
 
 	return kv
 }
